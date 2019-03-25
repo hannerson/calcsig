@@ -16,13 +16,13 @@
 #include <queue>
 #include <vector>
 #include <condition_variable>
-#include "config.h"
+#include "utils/config.h"
 #include <glog/logging.h>
 #include "mysqlpool/mysqlpool.h"
 #include "redispool/redispool.h"
 #include "objectpool/objectpool.hpp"
 #include "threadpool/threadpooltask.hpp"
-#include "utils.h"
+#include "utils/utils.h"
 #include <json/json.h>
 
 class httpServer{
@@ -80,6 +80,7 @@ class httpServer{
 		unsigned int redis_pool_maxnum;
 		std::string pic_artist;
 		std::string pic_album;
+		std::string redis_auth;
 		std::unordered_map<std::string, std::unordered_map<std::string,std::string> > server_config;
 };
 

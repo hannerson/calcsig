@@ -112,7 +112,7 @@ int select_pool(){
 	if(conn == nullptr){
 		std::cout << "conn null" << std::endl;
 	}
-	std::string sql = "select id,m_name,m_album_id,m_artists from MusicSrc limit 3";
+	std::string sql = "select * from MusicSrc limit 3";
 	int cnt = conn->execute(sql);
 	std::cout << cnt << std::endl;
 	if(cnt > 0){

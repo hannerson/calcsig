@@ -125,27 +125,40 @@ int mysqlconnector::connect(){
 	if(mysql == nullptr){
 		//std::cout << "init error" << std::endl;
 		//LOG(ERROR) << "init error" << std::endl;
-		return -1;
+		std::ostringstream ostr;
+		ostr << "mysql init failed" << std::endl;
+		throw std::runtime_error(ostr.str());
+		//return -1;
 	}
 	if(mysql_real_connect(mysql,host.c_str(),user.c_str(),passwd.c_str(),db.c_str(),port,NULL,0) == nullptr){
 		//std::cout << "connect error" << std::endl;
 		//LOG(ERROR) << "connect error:" << mysql_error(mysql) << std::endl;
-		return -1;
+		//return -1;
+		std::ostringstream ostr;
+		ostr << "mysql connect failed" << std::endl;
+		throw std::runtime_error(ostr.str());
 	}
 	//set charset
 	if(mysql_set_character_set(mysql,charset.c_str())){
 		//std::cout << "set character error " << mysql_error(mysql) << std::endl;
 		//LOG(ERROR) << "set character error" << mysql_error(mysql) << std::endl;
-		return -1;
+		std::ostringstream ostr;
+		ostr << "mysql set charset failed" << std::endl;
+		throw std::runtime_error(ostr.str());
+		//return -1;
 	}
 	return 0;
 }
 
 long mysqlconnector::execute(const std::string& sql){
 	long row_count = -1;
+	if(mysql_ping(mysql) != 0){
+		//reconnect
+		connect();
+	}
 	//std::cout << sql << std::endl;
 	if(mysql_real_query(mysql, sql.c_str(), sql.size())){
-		//std::cout << "query error" << std::endl;
+		std::cout << "query error" << mysql_error(mysql) << std::endl;
 		//LOG(ERROR) << "query error" << mysql_error(mysql) << std::endl;
 		return -1;
 	}
@@ -153,13 +166,13 @@ long mysqlconnector::execute(const std::string& sql){
 	//std::cout << "result:" << result << std::endl;
 	result->m_result = mysql_store_result(mysql);
 	if(result->m_result == NULL){
-		//std::cout << "store result " << mysql_error(mysql) << std::endl;
+		std::cout << "store result " << mysql_error(mysql) << std::endl;
 		//LOG(ERROR) << "store result " << mysql_error(mysql) << std::endl;
 		return -1;
 	}
 	//std::cout << "store" << std::endl;
 	if((row_count = mysql_num_rows(result->m_result)) == -1){
-		//std::cout << "affect rows " << mysql_error(mysql) << std::endl;
+		std::cout << "affect rows " << mysql_error(mysql) << std::endl;
 		//LOG(ERROR) << "affect rows " << mysql_error(mysql) << std::endl;
 		return -1;
 	}
@@ -177,14 +190,25 @@ class mysqlresult * mysqlconnector::fetchall(){
 	MYSQL_ROW row;
 	MYSQL_FIELD *fields;
 	int num_fields = mysql_num_fields(this->result->m_result);
+	std::cout << "fields:" << num_fields << std::endl;
 	fields = mysql_fetch_fields(this->result->m_result);
 	while((row = mysql_fetch_row(this->result->m_result))){
 		mysqlrow *sqlrow = new mysqlrow();
 		unsigned long * lengths = mysql_fetch_lengths(this->result->m_result);
 		for(int i=0; i<num_fields; i++){
 			mysqlfield *field_tmp = new mysqlfield(fields+i);
+			//std::cout << "fields:" << fields[i].name << std::endl;
+			if(row[i] == nullptr){
+				//std::cout << "fields value:" << "" << std::endl;
+			}else{
+				//std::cout << "fields value:" << row[i] << std::endl;
+			}
 			sqlrow->m_fields[fields[i].name] = field_tmp;
-			sqlrow->set_field(fields[i].name,std::string(row[i]), lengths[i]);
+			if(row[i] == nullptr){
+				sqlrow->set_field(fields[i].name,"", lengths[i]);
+			}else{
+				sqlrow->set_field(fields[i].name,std::string(row[i]), lengths[i]);
+			}
 			sqlrow->m_vfields.emplace_back(field_tmp);
 		}
 		this->result->m_rows.emplace_back(sqlrow);

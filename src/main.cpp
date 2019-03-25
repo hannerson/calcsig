@@ -1,5 +1,5 @@
 #include "server.h"
-#include "config.h"
+#include "utils/config.h"
 #include <glog/logging.h>
 
 
@@ -17,7 +17,10 @@ int main(int argc, char **argv){
 		return -1;
 	}
 	class httpServer * server = new class httpServer("0.0.0.0",12345);
-	server->init(configptr->config);
+	if(server->init(configptr->config) == -1){
+		std::cout << "init failed" << std::endl;
+		return -1;
+	}
 	LOG(INFO) << server->check_request_valid("1544113635","b6521a86bc4cc0830370f174e1a30b11") << std::endl;
 	server->start();
 	return 0;

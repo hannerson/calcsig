@@ -2,14 +2,14 @@
 #include <iostream>
 #include <thread>
 #include <mutex>
-#include "config.h"
+#include "utils/config.h"
 #include <openssl/md5.h>
 #include <sys/time.h>
 #include <sys/queue.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <exception>
-#include <string.h>
+#include <strings.h>
 #include <string>
 #include <set>
 #include <event.h>
@@ -51,66 +51,82 @@ int httpServer::init(std::unordered_map<std::string,std::unordered_map<std::stri
 		if(config_common.count("threadnum") > 0){
 			threadnum = atoi(config_common["threadnum"].c_str());
 		}else{
+			std::cout << "config threadnum not exists" << std::endl;
+			return -1;
+		}
+
+		if(config_common.count("threadmax") > 0){
+			threadmax = atoi(config_common["threadmax"].c_str());
+		}else{
+			std::cout << "config threadmax not exists" << std::endl;
 			return -1;
 		}
 
 		if(config_common.count("queue_max_size") > 0){
 			queue_max_size = atoi(config_common["queue_max_size"].c_str());
 		}else{
+			std::cout << "config queue_max_size not exists" << std::endl;
 			return -1;
 		}
 
 		if(config_common.count("secret_key") > 0){
 			secret_key = config_common["secret_key"];
 		}else{
+			std::cout << "config secret_key not exists" << std::endl;
 			return -1;
 		}
 
 		if(config_common.count("pic_artist") > 0){
 			pic_artist = config_common["pic_artist"];
 		}else{
+			std::cout << "config pic_artist not exists" << std::endl;
 			return -1;
 		}
 
 		if(config_common.count("pic_album") > 0){
 			pic_album = config_common["pic_album"];
 		}else{
+			std::cout << "config pic_album not exists" << std::endl;
 			return -1;
 		}
 
 		std::unordered_map<std::string,std::string> config_mysql = config["mysql"];
-		if(config_mysql.count("db_ip") > 0){
-			db_ip = config_mysql["db_ip"];
+		if(config_mysql.count("dbres_ip") > 0){
+			db_ip = config_mysql["dbres_ip"];
+		}else{
+			std::cout << "config dbres_ip not exists" << std::endl;
+			return -1;
+		}
+
+		if(config_mysql.count("dbres_user") > 0){
+			db_user = config_mysql["dbres_user"];
+		}else{
+			std::cout << "config dbres_user not exists" << std::endl;
+			return -1;
+		}
+
+		if(config_mysql.count("dbres_passwd") > 0){
+			db_passwd = config_mysql["dbres_passwd"];
+		}else{
+			std::cout << "config dbres_passwd not exists" << std::endl;
+			return -1;
+		}
+
+		if(config_mysql.count("dbres_name") > 0){
+			db_name = config_mysql["dbres_name"];
+		}else{
+			std::cout << "config dbres_name not exists" << std::endl;
+			return -1;
+		}
+
+		if(config_mysql.count("dbres_charset") > 0){
+			db_charset = config_mysql["dbres_charset"];
 		}else{
 			return -1;
 		}
 
-		if(config_mysql.count("db_user") > 0){
-			db_user = config_mysql["db_user"];
-		}else{
-			return -1;
-		}
-
-		if(config_mysql.count("db_passwd") > 0){
-			db_passwd = config_mysql["db_passwd"];
-		}else{
-			return -1;
-		}
-
-		if(config_mysql.count("db_name") > 0){
-			db_name = config_mysql["db_name"];
-		}else{
-			return -1;
-		}
-
-		if(config_mysql.count("db_charset") > 0){
-			db_charset = config_mysql["db_charset"];
-		}else{
-			return -1;
-		}
-
-		if(config_mysql.count("db_port") > 0){
-			db_port = atoi(config_mysql["db_port"].c_str());
+		if(config_mysql.count("dbres_port") > 0){
+			db_port = atoi(config_mysql["dbres_port"].c_str());
 		}else{
 			return -1;
 		}
@@ -140,6 +156,12 @@ int httpServer::init(std::unordered_map<std::string,std::unordered_map<std::stri
 			return -1;
 		}
 
+		if(config_redis.count("redis_auth") > 0){
+			redis_auth = config_redis["redis_auth"].c_str();
+		}else{
+			return -1;
+		}
+
 		if(config_redis.count("pool_num") > 0){
 			redis_pool_num = atoi(config_redis["pool_num"].c_str());
 		}else{
@@ -153,9 +175,16 @@ int httpServer::init(std::unordered_map<std::string,std::unordered_map<std::stri
 		}
 		//init mysql pool
 		mysql_pool = new mysqlPool(db_pool_num,db_pool_maxnum,db_ip,db_port,db_user,db_passwd,db_name,db_charset);
-		redis_pool = new redisPool(redis_pool_num, redis_pool_maxnum, redis_ip, redis_port);
+		if(redis_auth == ""){
+			redis_pool = new redisPool(redis_pool_num, redis_pool_maxnum, redis_ip, redis_port);
+		}else{
+			redis_pool = new redisPool(redis_pool_num, redis_pool_maxnum, redis_ip, redis_port,redis_auth);
+		}
 		thread_pool = new threadPool();
-		thread_pool-> init(threadnum,threadmax);
+		std::cout << threadnum << ":" << threadmax << std::endl;
+		if(thread_pool-> init(threadnum,threadmax) != 0){
+			throw std::runtime_error("thread pool init failed");
+		}
 		//init process function
 		map_server_func.emplace("/test",&httpServer::test_process);
 		map_server_func.emplace("/echo",&httpServer::echo_process);
@@ -235,9 +264,9 @@ int httpServer::start(){
 
 void httpServer::http_generic_handler(struct evhttp_request *request, void *args){
 	class httpServer *me = (class httpServer*) args;
-	//std::cout << (void*) request << std::endl;
-	//const char* uri = evhttp_request_get_uri(request);
-	//std::cout << "uri is " << uri << std::endl;
+	std::cout << (void*) request << std::endl;
+	const char* uri = evhttp_request_get_uri(request);
+	std::cout << "uri is " << uri << std::endl;
 	class http_task task(me,request);
 	me->thread_pool->task_add(&task);
 	LOG(INFO) << "add task" << std::endl;
@@ -573,73 +602,220 @@ void httpServer::getinfo_process(struct evhttp_request *request){
 
 	//check in redis
 	std::shared_ptr<redisconn> redis_conn = redis_pool->get_connection();
-	std::ostringstream command;
-	command << "HGETALL " << type_table << ":" << rid << std::endl;
-	redis_conn->sendCommand(command.str());
-	redisReply * m_reply = redis_conn->getReply();
-	if(m_reply->type == REDIS_REPLY_ARRAY && m_reply->elements > 0){
-		std::string key,value;
-		for(int i=0; i<m_reply->elements;i++){
-			if(m_reply->element[i]->type == REDIS_REPLY_STRING){
-				std::cout << m_reply->element[i]->str << std::endl;
-				//key
-				if(i%2 == 0){
-					key = m_reply->element[i]->str;
-				}else{//value
-					value = m_reply->element[i]->str;
-					if(key == ""){ //something wrong
-					}
-					tempjson[key] = value;
-				}
-			}else{
-			}
+	unsigned int audioSourceId = 0;
+	
+	std::ostringstream hashKey;
+	hashKey << type_table << ":" << rid;
+	std::cout << hashKey.str() << std::endl;
+	std::unordered_map<std::string,std::string> hashInfo = redis_conn->getHashAll(hashKey.str());
+	Json::Value payinfos(Json::arrayValue);
+	if(!hashInfo.empty()){
+		if(type == 0 && hashInfo.count("audiosourceid")>0){
+			audioSourceId = atol(hashInfo["audiosourceid"].c_str());
 		}
-	}else if(m_reply->type == REDIS_REPLY_ARRAY && m_reply->elements == 0){
+		for(auto it=hashInfo.begin();it!=hashInfo.end();++it){
+			tempjson[it->first] = it->second;
+		}
+	}else{
 		//check in mysql
 		std::shared_ptr<mysqlconnector> sql_conn = mysql_pool->get_connection();
 		std::ostringstream s_sql;
-		s_sql << "select * from " << type_table << " where id=" << rid << ";" << std::endl;
+		s_sql << "select * from " << type_table << " where id=" << rid;
+		std::cout << s_sql.str() << std::endl;
 		std::string sql = s_sql.str();
 		int cnt = sql_conn->execute(sql);
+		std::cout << "count:" << cnt << std::endl;
 		if(cnt > 0){
 			mysqlresult *res = sql_conn->fetchall();
-			for(auto iter=res->m_rows.begin();iter!=res->m_rows.end();iter++){
-				std::string redisfields;
-				int id = (*iter)->get_value("id");
-				std::cout <<(int)(*iter)->get_value("id") << std::endl;
-				if(server_config.count(type_table) == 0){
-					//error
+			std::cout << "XXXXXX" << std::endl;
+			if(res != nullptr){
+				for(auto iter=res->m_rows.begin();iter!=res->m_rows.end();iter++){
+					std::cout << "XXXXXX" << std::endl;
+					std::unordered_map<std::string,std::string> hashData;
+					int id = (*iter)->get_value("id");
+					audioSourceId = (*iter)->get_value("audiosourceid");
+					std::cout <<(int)(*iter)->get_value("id") << std::endl;
+					if(server_config.count(type_table) == 0){
+						//error
+					}
+					std::unordered_map<std::string,std::string> table_config = server_config[type_table];
+					for(auto it=table_config.begin(); it!=table_config.end(); ++it){
+						//std::cout << it->second << "---" << it->first << std::endl;
+						std::string val = (*iter)->get_value(it->first);
+						tempjson[it->second.c_str()] = val;
+						hashData.emplace(it->second,val);
+					}
+					//set redis data
+					hashKey.str("");
+					hashKey << type_table << ":" << rid;
+					std::cout << hashKey.str() << std::endl;
+					if(!redis_conn->setHash(hashKey.str(), hashData)){
+						std::cout << "set hash failed : " << rid << std::endl;
+					}
 				}
-				std::unordered_map<std::string,std::string> table_config = server_config[type_table];
-				for(auto it=table_config.begin(); it!=table_config.end(); ++it){
-					tempjson[it->second] = (*iter)->get_value(it->first);
-					redisfields += " " + it->second + " " + it->first;
-				}
-				//redisfields.erase(redisfields.find_last_not_of(" ")+1);
-				//set redis data
-				command << "HMSET " << type_table << ":" << rid << redisfields << std::endl;
-				redis_conn->sendCommand(command.str());
-				redisReply * m_reply = redis_conn->getReply();
-				if(m_reply->type == REDIS_REPLY_STATUS && m_reply->str == "OK"){
-				}else{//error
-				}
-				redis_conn->freeReply();
+				res->free();
+			}else{
+				std::cout << "sql fetch res null" << std::endl;
 			}
-			res->free();
 		}else{
 			//set redis null
-			command << "HMSET " << type_table << ":" << rid << " id 0"<< std::endl;
-			redis_conn->sendCommand(command.str());
-			redisReply * m_reply = redis_conn->getReply();
-			if(m_reply->type == REDIS_REPLY_STATUS && m_reply->str == "OK"){
-			}else{//error
+			hashKey.str("");
+			hashKey << type_table << ":" << rid;
+			std::cout << hashKey.str() << std::endl;
+			std::unordered_map<std::string,std::string> hashData;
+			hashData.emplace("id","0");
+			if(!redis_conn->setHash(hashKey.str(), hashData)){
 			}
-			redis_conn->freeReply();
 		}
-	}else{//error
 	}
-	redis_conn->freeReply();
-	 
+
+	if( type == 0 || type == 1){
+		//pay info
+		Json::Value payinfo;
+		hashKey.str("");
+		hashKey << type_table << ":Pay:" << rid;
+		std::cout << hashKey.str() << std::endl;
+		std::vector<std::string> payPolicy = redis_conn->getSet(hashKey.str());
+		if(!payPolicy.empty()){
+			for(auto itpolicy=payPolicy.begin();itpolicy!=payPolicy.end();++itpolicy){
+				if(*itpolicy == "none"){
+					continue;
+				}
+				hashKey.str("");
+				hashKey << type_table << ":" << *itpolicy << ":" << rid;
+				hashInfo = redis_conn->getHashAll(hashKey.str());
+				for(auto it=hashInfo.begin();it!=hashInfo.end();++it){
+					payinfo[it->first] = it->second;
+				}
+				payinfos.append(payinfo);
+			}
+		}else{
+			//check in mysql pay info
+			std::shared_ptr<mysqlconnector> sql_conn = mysql_pool->get_connection();
+			std::ostringstream s_sql;
+			s_sql << "select * from MusicPay where policy!=\"none\" and type=" << type << " and rid=" << rid;
+			std::cout << s_sql.str() << std::endl;
+			std::string sql = s_sql.str();
+			int cnt = sql_conn->execute(sql);
+			std::cout << "count:" << cnt << std::endl;
+			if(cnt > 0){
+				mysqlresult *res = sql_conn->fetchall();
+				if(res != nullptr){
+					for(auto iter=res->m_rows.begin();iter!=res->m_rows.end();iter++){
+						std::unordered_map<std::string,std::string> hashData;
+						int id = (*iter)->get_value("id");
+						std::cout <<(int)(*iter)->get_value("id") << std::endl;
+						std::string policy = (*iter)->get_value("policy");
+						if(server_config.count("Payinfo") == 0){
+							//error
+						}
+						std::unordered_map<std::string,std::string> table_config = server_config["Payinfo"];
+						for(auto it=table_config.begin(); it!=table_config.end(); ++it){
+							//std::cout << it->second << "---" << it->first << std::endl;
+							std::string val = (*iter)->get_value(it->first);
+							payinfo[it->second.c_str()] = val;
+							hashData.emplace(it->second,val);
+						}
+						//set redis data
+						hashKey.str("");
+						hashKey << type_table << ":" << policy << ":" << rid;
+						std::cout << hashKey.str() << std::endl;
+						if(!redis_conn->setHash(hashKey.str(), hashData)){
+						}
+						//set redis
+						hashKey.str("");
+						hashKey << type_table << ":Pay:" << rid;
+						std::cout << hashKey.str() << std::endl;
+						if(!redis_conn->setAdd(hashKey.str(), policy)){
+						}
+						if(!redis_conn->setDel(hashKey.str(), "none")){
+						}
+						payinfos.append(payinfo);
+					}
+					res->free();
+				}else{
+					std::cout << "sql fetch res null" << std::endl;
+				}
+			}else{
+				//set redis null
+				hashKey.str("");
+				hashKey << type_table << ":Pay:" << rid;
+				std::cout << hashKey.str() << std::endl;
+				if(!redis_conn->setAdd(hashKey.str(), "none")){
+				}
+			}
+		}
+	}
+	//audio info
+	Json::Value audioinfos(Json::arrayValue);
+	if(type == 0){
+		//audio info
+		Json::Value audioinfo;
+		hashKey.str("");
+		hashKey << type_table << ":Audio:" << rid;
+		std::cout << hashKey.str() << std::endl;
+		std::vector<std::string> audio_list = redis_conn->getSet(hashKey.str());
+		if(!audio_list.empty()){
+			for(auto itAudio=audio_list.begin();itAudio!=audio_list.end();++itAudio){
+				hashKey.str("");
+				hashKey << "Audio:" << *itAudio;
+				hashInfo = redis_conn->getHashAll(hashKey.str());
+				for(auto it=hashInfo.begin();it!=hashInfo.end();++it){
+					audioinfo[it->first] = it->second;
+				}
+				audioinfos.append(audioinfo);
+			}
+		}else{
+			if(audioSourceId > 0){
+				//check in mysql audio info
+				std::shared_ptr<mysqlconnector> sql_conn = mysql_pool->get_connection();
+				std::ostringstream s_sql;
+				s_sql << "select * from AudioProduct where audiosourceid=" << audioSourceId;
+				std::cout << s_sql.str() << std::endl;
+				std::string sql = s_sql.str();
+				int cnt = sql_conn->execute(sql);
+				std::cout << "count:" << cnt << std::endl;
+				if(cnt > 0){
+					mysqlresult *res = sql_conn->fetchall();
+					if(res != nullptr){
+						for(auto iter=res->m_rows.begin();iter!=res->m_rows.end();iter++){
+							std::unordered_map<std::string,std::string> hashData;
+							std::string audioProductId = (*iter)->get_value("id");
+							std::cout <<(int)(*iter)->get_value("id") << std::endl;
+							if(server_config.count("Audioinfo") == 0){
+								//error
+							}
+							std::unordered_map<std::string,std::string> table_config = server_config["Audioinfo"];
+							for(auto it=table_config.begin(); it!=table_config.end(); ++it){
+								//std::cout << it->second << "---" << it->first << std::endl;
+								std::string val = (*iter)->get_value(it->first);
+								audioinfo[it->second.c_str()] = val;
+								hashData.emplace(it->second,val);
+							}
+							//set redis data
+							hashKey.str("");
+							hashKey << "Audio:" << audioProductId;
+							std::cout << hashKey.str() << std::endl;
+							if(!redis_conn->setHash(hashKey.str(), hashData)){
+							}
+							//set redis
+							hashKey.str("");
+							hashKey << type_table << ":Audio:" << rid;
+							std::cout << hashKey.str() << std::endl;
+							if(!redis_conn->setAdd(hashKey.str(), audioProductId)){
+							}
+							audioinfos.append(audioinfo);
+						}
+						res->free();
+					}else{
+						std::cout << "sql fetch res null" << std::endl;
+					}
+				}
+			}
+		}
+	}
+	tempjson["payinfo"] = payinfos;
+	tempjson["audioinfo"] = audioinfos;
 	data[type_table] = tempjson;
 	result["status"] = "success";
 	result["msg"] = "OK";
