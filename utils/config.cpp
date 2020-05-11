@@ -1,24 +1,26 @@
 #include <iostream>
 #include <string>
-#include <unordered_map>
+#include <map>
 #include <fstream>
 #include "config.h"
-#include <glog/logging.h>
+#include "glog/logging.h"
 
 int configParser::loadConfig(){
 	std::ifstream infile(fileconfig.c_str());
 	if(!infile){
-		LOG(ERROR) << "file open:" << fileconfig << " failed." << std::endl;
+		//LOG(ERROR) << "file open:" << fileconfig << " failed." << std::endl;
 		return -1;
 	}
 	std::string instr;
 	std::string cur_key;
-	std::unordered_map<std::string, std::string> temp_map;
+	std::map<std::string, std::string> temp_map;
 	while(getline(infile, instr)){
 		int index = 0, index_left = 0, index_right = 0;
 		//del ' '
 		if(!instr.empty()){
-			while((index=instr.find(' ',index)) != std::string::npos){
+			//std::cout << instr << std::endl;
+			index=instr.find(' ',index);
+			while(index != std::string::npos){
 				instr.erase(index,1);
 			}
 		}
@@ -35,14 +37,14 @@ int configParser::loadConfig(){
 		if(index == std::string::npos && (index_left == std::string::npos || index_right == std::string::npos)){
 			continue;
 		}
-		//std::cout << instr << std::endl;
+		std::cout << instr << std::endl;
 
 		if(index_left != std::string::npos){
 			if(cur_key != ""){
-				config.emplace(cur_key,temp_map);
+				config.insert(std::pair<std::string,std::map<std::string, std::string> >(cur_key,temp_map));
 			}
 			cur_key = instr.substr(index_left+1,index_right-index_left-1);
-			//std::cout << cur_key << std::endl;
+			std::cout << cur_key << std::endl;
 			temp_map.clear();
 			continue;
 		}
@@ -50,23 +52,9 @@ int configParser::loadConfig(){
 		if(index == std::string::npos){
 			continue;
 		}
-		temp_map.emplace(instr.substr(0,index),instr.substr(index+1));
+		temp_map.insert(std::pair<std::string,std::string>(instr.substr(0,index),instr.substr(index+1)));
 	}
-	config.emplace(cur_key,temp_map);
+	config.insert(std::pair<std::string,std::map<std::string, std::string> >(cur_key,temp_map));
 	infile.close();
+	return 0;
 }
-
-//#define _CONFIG_TEST_
-#ifdef _CONFIG_TEST_
-int main(){
-	google::InitGoogleLogging("http_server");
-	google::SetLogDestination(google::INFO, "/home/dmsMusic/http_server");
-	class configParser* configptr = new configParser(std::string ("../conf/server.conf"));
-	configptr->loadConfig();
-	std::cout << configptr->config["common"]["threadnum"] << std::endl;
-	std::cout << configptr->config["common"]["secret_key"] << std::endl;
-	LOG(INFO) << "file config:" << configptr->fileconfig << std::endl;
-	std::cout << configptr->config["mysql"]["dbres_ip"] << std::endl;
-	LOG(INFO) << configptr->config["mysql"]["dbres_ip"] << std::endl;
-}
-#endif

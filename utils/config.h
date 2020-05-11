@@ -3,7 +3,7 @@
 
 #include <iostream>
 #include <string>
-#include <unordered_map>
+#include <map>
 
 class configParser{
 	public:
@@ -13,7 +13,7 @@ class configParser{
 
 	public:
 		std::string fileconfig;
-		std::unordered_map<std::string,std::unordered_map<std::string,std::string> > config;
+		std::map<std::string,std::map<std::string,std::string> > config;
 };
 
 #endif

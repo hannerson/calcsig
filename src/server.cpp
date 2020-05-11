@@ -1,7 +1,5 @@
 #include "server.h"
 #include <iostream>
-#include <thread>
-#include <mutex>
 #include "utils/config.h"
 #include <openssl/md5.h>
 #include <sys/time.h>
@@ -13,41 +11,284 @@
 #include <string>
 #include <set>
 #include <event.h>
-#include <json/json.h>
+#include "json/json.h"
+#include <event2/thread.h>
+#include <event2/util.h>
+#include "curl/curl.h"
 
-std::unordered_map<std::string, server_func> map_server_func;
+#define BUFFSIZE 1024*1024
 
-class http_task:public Task{
+struct downloadInfo{
+	int fd;
+	uint32_t file_sig1;
+	uint32_t file_sig2;
+	char file_path[128];
+	char buffer[BUFFSIZE];
+	uint64_t content_length;
+	uint64_t content_read;
+	uint64_t buffer_used_size;
+	std::string fileformat;
+	bool isOK;
+};
+
+struct callbackInfo{
+	uint64_t content_length;
+	uint64_t content_read;
+	std::string content;
+};
+
+class http_task:public task_item{
 	public:
-		http_task(class httpServer * server, struct evhttp_request *request):server(server),request(request){}
+		http_task(){}
 		~http_task(){
 		}
-		void run(){
-			if(server == nullptr){
-				return;
-			}
-			server->run_worker(request);
+	public:
+		std::string action_id;
+		std::string src_url;
+		std::string file_format;
+		std::string table;
+		std::string callback_url;
+};
+
+static size_t data_reader(void *ptr, size_t size, size_t nmemb, void *param)
+{
+    downloadInfo *curl_info = (downloadInfo*)param;
+    curl_info->content_read += size * nmemb;
+
+    int data_read = 0;
+    int read_size;
+    write(curl_info->fd, (char*)ptr, size * nmemb);
+    LOG(INFO) << "flush data to file, already " << curl_info->content_read << " data" << std::endl;
+    /*while (data_read < size * nmemb)
+    {
+        read_size = BUFFSIZE - curl_info->buffer_used_size > size * nmemb - data_read
+                    ? size * nmemb - data_read
+                    : BUFFSIZE - curl_info->buffer_used_size;
+
+        memcpy(curl_info->buffer + curl_info->buffer_used_size, 
+               (char *)ptr + data_read,
+               read_size);
+
+        data_read += read_size;
+        curl_info->buffer_used_size += read_size;
+
+        if (curl_info->buffer_used_size == BUFFSIZE)
+        {
+            LOG(INFO) << "flush data to file, already " << curl_info->content_read << " data" << std::endl;
+            write(curl_info->fd, curl_info->buffer, BUFFSIZE);
+            curl_info->buffer_used_size = 0;
+        }
+    }*/
+	return size * nmemb;
+}
+
+
+static size_t head_reader(void* ptr, size_t size, size_t nmemb, void* param)
+{
+    char* pos = strstr((char*)ptr, ":");
+    if (pos == NULL)
+    {
+        return size * nmemb;
+    }    
+
+    downloadInfo *curl_info = (downloadInfo*)param;
+    if (ptr == strstr((char*)ptr, "Content-Length"))
+    {
+       std::string number(pos + 2, size * nmemb - (pos + 2 - (char*)ptr)); 
+       curl_info->content_length = strtoul(number.c_str(), NULL, 10);
+    }    
+	return size * nmemb;
+}
+
+static size_t callback_head_reader(void* ptr, size_t size, size_t nmemb, void* param)
+{
+    char* pos = strstr((char*)ptr, ":");
+    if (pos == NULL)
+    {
+        return size * nmemb;
+    }    
+
+    callbackInfo *curl_info = (callbackInfo*)param;
+    if (ptr == strstr((char*)ptr, "Content-Length"))
+    {
+       std::string number(pos + 2, size * nmemb - (pos + 2 - (char*)ptr)); 
+       curl_info->content_length = strtoul(number.c_str(), NULL, 10);
+    }    
+	return size * nmemb;
+}
+
+static size_t callback_data_reader(void *ptr, size_t size, size_t nmemb, void *param)
+{
+    callbackInfo *curl_info = (callbackInfo*)param;
+    std::string content((char*)ptr, size * nmemb);
+    curl_info->content += content;
+    curl_info->content_read += size * nmemb;
+	return size * nmemb;
+}
+
+void thread_worker(void *args){
+	class threadpool_98 *pool = (class threadpool_98*)args;
+	class httpServer *server = (class httpServer*)pool->server;
+	//thread init register
+	pthread_mutex_lock(&server->init_lock);
+	server->init_count ++;
+	LOG(INFO) << "init count - " << server->init_count << std::endl;
+	pthread_cond_signal(&server->init_cond);
+	pthread_mutex_unlock(&server->init_lock);
+
+	const std::string base_path = server->server_config["common"]["base_path"];
+
+	while(!server->stop_status()){
+		//get task
+		class http_task *task = (class http_task*)pool->get_task();
+		if(task == NULL){
+			continue;
 		}
-	private:
-		class httpServer *server;
-		struct evhttp_request *request;
-};
+		std::string tmp_real_path = base_path + "/tmp/" + randString(16,true,true) + "." + task->file_format;
+		LOG(INFO) << tmp_real_path << std::endl;
+		std::string tmp_real_dir = base_path + "/tmp/";
+		if((access(tmp_real_dir.c_str(), R_OK | W_OK | X_OK)!=0) && (mkdirs(base_path + "/tmp/", S_IRUSR|S_IWUSR|S_IXUSR)!=0)){
+			LOG(ERROR) << "tmp dir not exists." << std::endl;
+			delete task;
+			continue;
+		}
+		downloadInfo *curl_info = new downloadInfo();
+		curl_info->fd = open(tmp_real_path.c_str(), O_WRONLY|O_CREAT|O_TRUNC, 0644);
+		curl_info->file_sig1 = 0;
+		curl_info->file_sig2 = 0;
+		curl_info->content_length = 0;
+		curl_info->content_read = 0;
+		curl_info->buffer_used_size = 0;
+		curl_info->isOK = true;
+		//download file
+		CURL *curl = curl_easy_init();
+		if(curl == NULL){
+			delete curl_info;
+			curl_info = NULL;
+			continue;
+		}
+		CURLcode res;
+		curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1L);
+        	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+        	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+		curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 500);
+        	curl_easy_setopt(curl, CURLOPT_FTP_RESPONSE_TIMEOUT, 1);
+        	curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, BUFFSIZE);
+		curl_easy_setopt(curl, CURLOPT_HEADERDATA, curl_info);
+        	curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, head_reader);
+        	curl_easy_setopt(curl, CURLOPT_WRITEDATA, curl_info);
+        	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, data_reader);
+		curl_easy_setopt(curl, CURLOPT_URL, task->src_url.c_str());
+		res = curl_easy_perform(curl);
+		if(res != CURLE_OK){
+			LOG(INFO) << "curl download error. taskid-" << task->action_id << "." << std::endl;
+			curl_info->isOK = false;
+		}
+		long response_code;
+		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+		if(response_code != 200){
+			LOG(INFO) << "curl download error. taskid-" << task->action_id << ". response code-" << response_code << "." << std::endl;
+			curl_info->isOK = false;
+		}
+		curl_easy_cleanup(curl);
+		close(curl_info->fd);
+		if(!curl_info->isOK){
+			delete curl_info;
+			curl_info = NULL;
+			//remove tmp
+			remove(tmp_real_path.c_str());
+			continue;
+		}
+		//calc sig
+		if(!calcSig(tmp_real_path.c_str(), &curl_info->file_sig1, &curl_info->file_sig2)){
+			LOG(ERROR) << formatStr("calc sig failed. path %s",tmp_real_path.c_str()) << std::endl;
+			curl_info->isOK = false;
+			delete task;
+			delete curl_info;
+			curl_info = NULL;
+			continue;
+		}
+		//mv target path
+		std::string sig_path = sigPath(curl_info->file_sig1,curl_info->file_sig2,task->file_format);
+		std::string target_path = base_path + "/" + sig_path;
+		if(mvfile(tmp_real_path, target_path) != 0){
+			LOG(ERROR) << formatStr("mv file failed.from %s to %s",tmp_real_path.c_str(),target_path.c_str()) << std::endl;
+			curl_info->isOK = false;
+			delete task;
+			delete curl_info;
+			curl_info = NULL;
+			continue;
+		}
+		//callback
+		Json::FastWriter writer;
+		Json::Reader reader;
+		Json::Value item;
+		Json::Value result;
+		item["action_id"] = task->action_id.c_str();
+		item["file_sig1"] = curl_info->file_sig1;
+		item["file_sig2"] = curl_info->file_sig2;
+		item["file_path"] = sig_path.c_str();
+		item["file_size"] = (Json::Value::UInt64)curl_info->content_length;
+		item["my_ip"] = server->my_ip.c_str();
+		item["table"] = task->table.c_str();
 
-const struct{
-	std::string uri;
-	void (httpServer::*func)(struct evhttp_request *);
-} request_process_config[] = {
-	{"/test",&httpServer::test_process},
-	{"/echo",&httpServer::echo_process},
-	{"/getinfo",&httpServer::getinfo_process},
-	{"/other",&httpServer::other_process},
-};
+		delete curl_info;
+		curl_info = NULL;
 
+		callbackInfo *curl_callback = new callbackInfo();
+		std::string ret_str = writer.write(item);
+		curl = curl_easy_init();
+        	if(curl == NULL){
+            		delete curl_callback;
+			curl_callback = NULL;
+            		continue;
+        	}
+		struct curl_slist *headers = NULL;
+		headers = curl_slist_append(headers, "Content-Type: application/json");
+		headers = curl_slist_append(headers, "Accept: application/json");
+		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+		curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1L);
+        	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+        	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+		curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 500);
+		curl_easy_setopt(curl, CURLOPT_HEADERDATA, curl_callback);
+        	curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, callback_head_reader);
+        	curl_easy_setopt(curl, CURLOPT_WRITEDATA, curl_callback);
+        	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, callback_data_reader);
+		curl_easy_setopt(curl, CURLOPT_POST, 1);
+		curl_easy_setopt(curl,CURLOPT_VERBOSE,1);
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, ret_str.c_str());
 
-int httpServer::init(std::unordered_map<std::string,std::unordered_map<std::string,std::string> > config){
+		curl_easy_setopt(curl, CURLOPT_URL, task->callback_url.c_str());
+		res = curl_easy_perform(curl);
+		LOG(INFO) << formatStr("callback-%s. taskid-%s, post data:%s",task->action_id.c_str(),task->callback_url.c_str(),ret_str.c_str()) << std::endl;
+		if(res != CURLE_OK){
+			LOG(ERROR) << "curl callback error. taskid-" << task->action_id << "." << std::endl;
+		}
+		LOG(INFO) << formatStr("callback-%s. taskid-%s, response data:%s",task->action_id.c_str(),task->callback_url.c_str(),curl_callback->content.c_str()) << std::endl;
+		if(!reader.parse(curl_callback->content,result)){
+			LOG(ERROR) << formatStr("callback error parse json result. taskid-%s",task->action_id.c_str()) << std::endl;
+		}
+		if(result["ret"] != 0){
+			LOG(ERROR) << formatStr("callback failed. taskid-%s",task->action_id.c_str()) << std::endl;
+		}
+		curl_easy_cleanup(curl);
+		curl_slist_free_all(headers);
+		delete task;
+        	delete curl_callback;
+	}
+}
+
+FUNC_PTR threadpool_98::fp = thread_worker;
+
+int httpServer::init(std::map<std::string,std::map<std::string,std::string> > config){
 	try{
+		//pthread init
+		pthread_mutex_init(&init_lock,NULL);
+		pthread_cond_init(&init_cond,NULL);
+		//config init
 		server_config = config;
-		std::unordered_map<std::string,std::string> config_common = config["common"];
+		std::map<std::string,std::string> config_common = config["common"];
 		if(config_common.count("threadnum") > 0){
 			threadnum = atoi(config_common["threadnum"].c_str());
 		}else{
@@ -76,130 +317,24 @@ int httpServer::init(std::unordered_map<std::string,std::unordered_map<std::stri
 			return -1;
 		}
 
-		if(config_common.count("pic_artist") > 0){
-			pic_artist = config_common["pic_artist"];
+		if(config_common.count("my_ip") > 0){
+			my_ip = config_common["my_ip"];
 		}else{
-			std::cout << "config pic_artist not exists" << std::endl;
+			std::cout << "config my_ip not exists" << std::endl;
 			return -1;
 		}
 
-		if(config_common.count("pic_album") > 0){
-			pic_album = config_common["pic_album"];
-		}else{
-			std::cout << "config pic_album not exists" << std::endl;
-			return -1;
-		}
-
-		std::unordered_map<std::string,std::string> config_mysql = config["mysql"];
-		if(config_mysql.count("dbres_ip") > 0){
-			db_ip = config_mysql["dbres_ip"];
-		}else{
-			std::cout << "config dbres_ip not exists" << std::endl;
-			return -1;
-		}
-
-		if(config_mysql.count("dbres_user") > 0){
-			db_user = config_mysql["dbres_user"];
-		}else{
-			std::cout << "config dbres_user not exists" << std::endl;
-			return -1;
-		}
-
-		if(config_mysql.count("dbres_passwd") > 0){
-			db_passwd = config_mysql["dbres_passwd"];
-		}else{
-			std::cout << "config dbres_passwd not exists" << std::endl;
-			return -1;
-		}
-
-		if(config_mysql.count("dbres_name") > 0){
-			db_name = config_mysql["dbres_name"];
-		}else{
-			std::cout << "config dbres_name not exists" << std::endl;
-			return -1;
-		}
-
-		if(config_mysql.count("dbres_charset") > 0){
-			db_charset = config_mysql["dbres_charset"];
-		}else{
-			return -1;
-		}
-
-		if(config_mysql.count("dbres_port") > 0){
-			db_port = atoi(config_mysql["dbres_port"].c_str());
-		}else{
-			return -1;
-		}
-
-		if(config_mysql.count("db_pool_num") > 0){
-			db_pool_num = atoi(config_mysql["db_pool_num"].c_str());
-		}else{
-			return -1;
-		}
-
-		if(config_mysql.count("db_pool_maxnum") > 0){
-			db_pool_maxnum = atoi(config_mysql["db_pool_maxnum"].c_str());
-		}else{
-			return -1;
-		}
-
-		std::unordered_map<std::string,std::string> config_redis = config["redis"];
-		if(config_redis.count("redis_ip") > 0){
-			redis_ip = config_redis["redis_ip"];
-		}else{
-			return -1;
-		}
-
-		if(config_redis.count("redis_port") > 0){
-			redis_port = atoi(config_redis["redis_port"].c_str());
-		}else{
-			return -1;
-		}
-
-		if(config_redis.count("redis_auth") > 0){
-			redis_auth = config_redis["redis_auth"].c_str();
-		}else{
-			return -1;
-		}
-
-		if(config_redis.count("pool_num") > 0){
-			redis_pool_num = atoi(config_redis["pool_num"].c_str());
-		}else{
-			return -1;
-		}
-
-		if(config_redis.count("pool_maxnum") > 0){
-			redis_pool_maxnum = atoi(config_redis["pool_maxnum"].c_str());
-		}else{
-			return -1;
-		}
-		//init mysql pool
-		mysql_pool = new mysqlPool(db_pool_num,db_pool_maxnum,db_ip,db_port,db_user,db_passwd,db_name,db_charset);
-		if(redis_auth == ""){
-			redis_pool = new redisPool(redis_pool_num, redis_pool_maxnum, redis_ip, redis_port);
-		}else{
-			redis_pool = new redisPool(redis_pool_num, redis_pool_maxnum, redis_ip, redis_port,redis_auth);
-		}
-		thread_pool = new threadPool();
+		thread_pool = new threadpool_98(threadnum,threadmax,queue_max_size);
+		thread_pool->server = this; 
 		std::cout << threadnum << ":" << threadmax << std::endl;
-		if(thread_pool-> init(threadnum,threadmax) != 0){
-			throw std::runtime_error("thread pool init failed");
-		}
-		//init process function
-		map_server_func.emplace("/test",&httpServer::test_process);
-		map_server_func.emplace("/echo",&httpServer::echo_process);
-		map_server_func.emplace("/getinfo",&httpServer::getinfo_process);
-		map_server_func.emplace("/other",&httpServer::other_process);
 	}
 	catch(char * e){
 	}
 	return 0;
 }
 
-int httpServer::stop(){
-	std::lock_guard<std::mutex> lock(isstop_mutex);
+void httpServer::stop(){
 	isstop = false;
-	return 0;
 }
 
 bool httpServer::check_request_valid(std::string timestamps, std::string md5sum){
@@ -228,8 +363,23 @@ bool httpServer::check_request_valid(std::string timestamps, std::string md5sum)
 }
 
 int httpServer::start(){
+	evthread_use_pthreads();
+	init_count = 0;
+	//init the seeds
+	timeval tv;
+   	gettimeofday(&tv, 0);
+    	srand((int64_t)tv.tv_sec * 1000000 + (int64_t)tv.tv_usec);
+	//start sub threads
+	thread_pool->start();
+
+	pthread_mutex_lock(&init_lock);
+	while(init_count < threadnum){
+		pthread_cond_wait(&init_cond,&init_lock);
+	}
+	pthread_mutex_unlock(&init_lock);
+
 	struct event_base *base = event_base_new();
-	if(base == nullptr){
+	if(base == NULL){
 		LOG(ERROR) << "create event base failed" << std::endl;
 		return -1;
 	}
@@ -244,158 +394,27 @@ int httpServer::start(){
 		return -1;
 	}
 
-	evhttp_set_gencb(http_server, http_generic_handler, this);
+	evhttp_set_cb(http_server,"/test",httpServer::test_process, this);
+	evhttp_set_cb(http_server,"/calcsig",httpServer::calcsig_process, this);
+	evhttp_set_gencb(http_server, httpServer::other_process, this);
 
-	//start threadworker
-	//
-	/*for(auto i=0; i<threadnum; i++){
-		threadpool.emplace_back(std::thread(&httpServer::thread_worker,this));
-		LOG(INFO) << "create thread "<< i << " success" << std::endl;
-	}*/
 	//set timer event and timeout
+	struct timeval tv_in = {10, 0};
 	struct event *ev_timeout = event_new(NULL,-1, 0, NULL, NULL);
 	event_assign(ev_timeout, base, -1, EV_TIMEOUT | EV_PERSIST, event_timeout, NULL);
-	event_add(ev_timeout, NULL);
+	event_add(ev_timeout, &tv_in);
 
 	evhttp_set_timeout(http_server,5);
 	event_base_dispatch(base);
 	evhttp_free(http_server);
-}
-
-void httpServer::http_generic_handler(struct evhttp_request *request, void *args){
-	class httpServer *me = (class httpServer*) args;
-	std::cout << (void*) request << std::endl;
-	const char* uri = evhttp_request_get_uri(request);
-	std::cout << "uri is " << uri << std::endl;
-	class http_task task(me,request);
-	me->thread_pool->task_add(&task);
-	LOG(INFO) << "add task" << std::endl;
-	//std::cout << "add task" << std::endl;
-	//sleep(3);
-}
-
-void httpServer::add_task(struct evhttp_request *request){
-	std::unique_lock<std::mutex> lock(queue_mutex);
-	m_not_full.wait(lock, [this]{return isstop || not_full();});
-	if(isstop){
-		return;
-	}
-	task_queue.emplace(request);
-	m_not_empty.notify_all();
-}
-
-void httpServer::get_task(struct evhttp_request **request){
-	std::unique_lock<std::mutex> lock(queue_mutex);
-	m_not_empty.wait(lock, [this]{return isstop || not_empty();});
-	if(isstop){
-		return;
-	}
-	*request = task_queue.front();
-	task_queue.pop();
-	m_not_full.notify_all();
-}
-
-bool httpServer::not_full(){
-	bool full = task_queue.size() >= queue_max_size;
-	if(full){
-		LOG(INFO) << "task queue is full:" << queue_max_size << std::endl;
-	}
-	return !full;
-}
-
-bool httpServer::not_empty(){
-	bool empty = task_queue.empty();
-	if(empty){
-		LOG(INFO) << "task queue is empty" << std::endl;
-	}
-	return !empty;
-}
-
-int httpServer::run_worker(struct evhttp_request *request){
-	//struct evhttp_request *request;
-	//std::cout << (void*) request << std::endl;
-	LOG(INFO) << "get task ok" << std::endl;
-	//std::cout << "get task ok " << std::this_thread::get_id() << std::endl;
-	//process request
-	const char* uri = evhttp_request_get_uri(request);
-	if(uri == nullptr){
-		LOG(INFO) << "uri is null" << std::endl;
-		//std::cout << "uri is null" << std::endl;
-		struct evbuffer *retbuff = nullptr;
-		retbuff = evbuffer_new();
-		if(retbuff == nullptr){
-			LOG(ERROR) << "evbuffer create failed" << std::endl;
-			return -1;
-		}
-		Json::Value result;
-		Json::FastWriter writer;
-		result["status"] = "success";
-		result["msg"] = "uri is null";
-		std::string return_str = writer.write(result);
-		int ret = evbuffer_add_printf(retbuff, return_str.c_str());
-		if(ret == -1){
-			LOG(ERROR) << "evbuffer printf failed" << std::endl;
-			return -1;
-		}
-		evhttp_send_reply(request,HTTP_OK,"ok",retbuff);
-		evbuffer_free(retbuff);
-	}
-	std::cout << "uri is " << uri << std::endl;
-	//std::string s_uri = evhttp_uri_parse(uri);
-	//std::size_t pos = s_uri.find("?");
-	struct evhttp_uri *decoded = nullptr;
-	decoded = evhttp_uri_parse(uri);
-	if(decoded == nullptr){
-		std::cout << "error" << std::endl;
-		LOG(INFO) << "evhttp_uri_parse error" << std::endl;
-		evhttp_send_error(request, HTTP_BADREQUEST, 0);
-		return -1;
-	}
-	std::string uri_path = evhttp_uri_get_path(decoded);
-	free(decoded);
-	/*if(pos != std::string::npos){
-		uri_path = s_uri.substr(0,pos);
-	}else{
-		uri_path = uri;
-	}*/
-
-	
-	if(uri_path == ""){
-		LOG(INFO) << "uri is empty" << std::endl;
-		std::cout << "uri is empty" << std::endl;
-		struct evbuffer *retbuff = nullptr;
-		retbuff = evbuffer_new();
-		if(retbuff == nullptr){
-			LOG(ERROR) << "evbuffer create failed" << std::endl;
-			return -1;
-		}
-		Json::Value result;
-		Json::FastWriter writer;
-		result["status"] = "success";
-		result["msg"] = "uri is empty";
-		std::string return_str = writer.write(result);
-		int ret = evbuffer_add_printf(retbuff, return_str.c_str());
-		if(ret == -1){
-			LOG(ERROR) << "evbuffer printf failed" << std::endl;
-			return -1;
-		}
-		evhttp_send_reply(request,HTTP_OK,"ok",retbuff);
-		evbuffer_free(retbuff);
-	}else{
-		//process request
-		if(map_server_func.find(uri_path) != map_server_func.end()){
-			(this->*map_server_func[uri_path])(request);
-		}else{
-			(this->*map_server_func["/other"])(request);
-		}
-	}
 	return 0;
 }
 
-void httpServer::test_process(struct evhttp_request *request){
-	struct evbuffer *retbuff = nullptr;
+void httpServer::test_process(struct evhttp_request *request, void *args){
+	LOG(INFO) << "test request" << std::endl;
+	struct evbuffer *retbuff = NULL;
 	retbuff = evbuffer_new();
-	if(retbuff == nullptr){
+	if(retbuff == NULL){
 		LOG(ERROR) << "evbuffer create failed" << std::endl;
 		return;
 	}
@@ -403,6 +422,7 @@ void httpServer::test_process(struct evhttp_request *request){
 	Json::FastWriter writer;
 	result["status"] = "success";
 	result["msg"] = "just test page!";
+	result["ret"] = "0";
 	std::string return_str = writer.write(result);
 	int ret = evbuffer_add_printf(retbuff, return_str.c_str());
 	if(ret == -1){
@@ -413,45 +433,19 @@ void httpServer::test_process(struct evhttp_request *request){
 	evbuffer_free(retbuff);
 }
 
-void httpServer::echo_process(struct evhttp_request *request){
-	const char* uri = evhttp_request_get_uri(request);
-	struct evbuffer *retbuff = nullptr;
+void httpServer::other_process(struct evhttp_request *request, void *args){
+	LOG(INFO) << "other request" << std::endl;
+	struct evbuffer *retbuff = NULL;
 	retbuff = evbuffer_new();
-	if(retbuff == nullptr){
+	if(retbuff == NULL){
 		LOG(ERROR) << "evbuffer create failed" << std::endl;
 		return;
 	}
 	Json::Value result;
 	Json::FastWriter writer;
-	//Json::Value data(Json::arrayValue);
-	Json::Value data;
-	result["status"] = "success";
-	result["msg"] = "uri is " + std::string(uri);
-	result["data"] = data;
-	std::string return_str = writer.write(result);
-	int ret = evbuffer_add_printf(retbuff, return_str.c_str());
-	if(ret == -1){
-		LOG(ERROR) << "evbuffer printf failed" << std::endl;
-		return;
-	}
-	evhttp_send_reply(request,HTTP_OK,"ok",retbuff);
-	evbuffer_free(retbuff);
-}
-
-void httpServer::other_process(struct evhttp_request *request){
-	struct evbuffer *retbuff = nullptr;
-	retbuff = evbuffer_new();
-	if(retbuff == nullptr){
-		LOG(ERROR) << "evbuffer create failed" << std::endl;
-		return;
-	}
-	Json::Value result;
-	Json::FastWriter writer;
-	//Json::Value data(Json::arrayValue);
-	Json::Value data;
 	result["status"] = "success";
 	result["msg"] = "wrong access,kidding me?";
-	result["data"] = data;
+	result["ret"] = "-1";
 	std::string return_str = writer.write(result);
 	int ret = evbuffer_add_printf(retbuff, return_str.c_str());
 	if(ret == -1){
@@ -462,119 +456,29 @@ void httpServer::other_process(struct evhttp_request *request){
 	evbuffer_free(retbuff);
 }
 
-//uri:/getinfo?timestamp=12345&pkey=dfjkdfkdlfdk&rid=123456&type=0  0-music,1-album,2-artist
-void httpServer::getinfo_process(struct evhttp_request *request){
-	const char* uri = evhttp_request_get_uri(request);
-	std::cout << uri << "  -------  " << std::endl;
-	struct evhttp_uri *decoded = nullptr;
-	decoded = evhttp_uri_parse(uri);
-
-	if(decoded == nullptr){
-		std::cout << "error" << std::endl;
-		LOG(INFO) << "evhttp_uri_parse error" << std::endl;
-		evhttp_send_error(request, HTTP_BADREQUEST, 0);
-		return;
-	}
-
+//uri:/calcsig {"timestamp":"12345","pkey":"dfjkdfkdlfdk","rid":"123456"}
+//1.check valid
+//2.parse json
+//3.add task
+//4.return ok
+void httpServer::calcsig_process(struct evhttp_request *request, void *args){
+	class httpServer *server = (class httpServer*)args;
 	Json::Value result;
 	Json::FastWriter writer;
-	//Json::Value data(Json::arrayValue);
 	Json::Value data;
-
-	struct evbuffer *retbuff = nullptr;
+	Json::Reader reader;
+	LOG(INFO) << "calcsig request" << std::endl;
+	struct evbuffer *retbuff = NULL;
 	retbuff = evbuffer_new();
-	if(retbuff == nullptr){
+	if(retbuff == NULL){
 		LOG(ERROR) << "evbuffer create failed" << std::endl;
 		return;
 	}
 
-	if(evhttp_request_get_command(request) != EVHTTP_REQ_GET){
+	if(evhttp_request_get_command(request) != EVHTTP_REQ_POST){
 		result["status"] = "fail";
 		result["msg"] = "just support get method";
-		std::string return_str = writer.write(result);
-		int ret = evbuffer_add_printf(retbuff, return_str.c_str());
-		if(ret == -1){
-			LOG(ERROR) << "evbuffer printf failed" << std::endl;
-			return;
-		}
-		evhttp_send_reply(request,HTTP_OK,"ok",retbuff);
-		evbuffer_free(retbuff);
-		return;
-	}
-	char *query = (char*)evhttp_uri_get_query(decoded);
-	if(query == nullptr){
-	}
-	//evhttp_parse_query_str(query, params);
-	char* decode_uri = evhttp_decode_uri(uri);
-	std::cout << decode_uri << "  -------  " << std::endl;
-	struct evkeyvalq params;
-	//evhttp_parse_query(decode_uri,&params);
-	evhttp_parse_query_str(query, &params);
-	std::cout << "----" << std::endl;
-	const char* temp = nullptr;
-	std::string timestamp,pkey;
-	unsigned int type;
-	unsigned long rid;
-
-	temp = evhttp_find_header(&params,"timestamp");
-	if(temp){
-		timestamp = temp;
-		std::cout << timestamp << std::endl;
-	}
-	temp = evhttp_find_header(&params,"pkey");
-	if(temp){
-		pkey = temp;
-		std::cout << pkey << std::endl;
-	}
-
-	temp = evhttp_find_header(&params,"rid");
-	if(temp){
-		rid = atol(temp);
-		std::cout << rid << std::endl;
-	}
-
-	temp = evhttp_find_header(&params,"type");
-	if(temp){
-		type = atoi(temp);
-		std::cout << type << std::endl;
-	}
-
-	free(decode_uri);
-
-	if(timestamp == "" || pkey == ""){
-		result["status"] = "fail";
-		result["msg"] = "parameter is missing";
-		result["data"] = data;
-		std::string return_str = writer.write(result);
-		int ret = evbuffer_add_printf(retbuff, return_str.c_str());
-		if(ret == -1){
-			LOG(ERROR) << "evbuffer printf failed" << std::endl;
-			return;
-		}
-		evhttp_send_reply(request,HTTP_OK,"ok",retbuff);
-		evbuffer_free(retbuff);
-		return;
-	}
-	//check valid
-	/*if(!check_request_valid(timestamp,pkey)){
-		result["status"] = "fail";
-		result["msg"] = "valid check failed";
-		result["data"] = data;
-		std::string return_str = writer.write(result);
-		int ret = evbuffer_add_printf(retbuff, return_str.c_str());
-		if(ret == -1){
-			LOG(ERROR) << "evbuffer printf failed" << std::endl;
-			return;
-		}
-		evhttp_send_reply(request,HTTP_OK,"ok",retbuff);
-		evbuffer_free(retbuff);
-		return;
-	}*/
-
-	if(rid == 0){
-		result["status"] = "fail";
-		result["msg"] = "rid is wrong";
-		result["data"] = data;
+		result["ret"] = "-1";
 		std::string return_str = writer.write(result);
 		int ret = evbuffer_add_printf(retbuff, return_str.c_str());
 		if(ret == -1){
@@ -586,240 +490,40 @@ void httpServer::getinfo_process(struct evhttp_request *request){
 		return;
 	}
 
-	Json::Reader reader;
-	Json::Value tempjson;
-	std::string toparse;
-	std::string type_table;
-	if(type == 0){
-		type_table = "Music";
-	}else if(type == 1){
-		type_table = "Album";
-	}else if(type == 2){
-		type_table = "Artist";
+	struct evbuffer* evInput = evhttp_request_get_input_buffer(request);
+
+	int nRead = 0;
+	int offset = 0;
+	char szTemp[2048];
+	while ((nRead = evbuffer_remove(evInput, szTemp + offset, sizeof(szTemp) - offset)) > 0)
+	{
+		offset += nRead;
+	}
+	//parse and add task
+	class http_task *task = new http_task();
+	if(!reader.parse(szTemp,data)){
+		LOG(ERROR) << "parse calc sig action json error" << std::endl;
+	}
+	LOG(INFO) << szTemp << std::endl;
+	if(!data.isMember("action_id") || !data.isMember("src_url") || !data.isMember("callback_url")){
+		result["status"] = "success";
+		result["msg"] = "parameter missing";
+		result["ret"] = "-1";
 	}else{
-		type_table = "Music";
+		LOG(INFO) << data["action_id"].asString() << std::endl;
+		task->action_id = data["action_id"].asString();
+		task->src_url = data["src_url"].asString();
+		task->callback_url = data["callback_url"].asString();
+		task->table = data["table"].asString();
+		task->file_format = data["file_format"].asString();
+		server->thread_pool->add_task(task);
+		result["status"] = "success";
+		result["msg"] = "OK";
+		result["ret"] = "0";
 	}
 
-	//check in redis
-	std::shared_ptr<redisconn> redis_conn = redis_pool->get_connection();
-	unsigned int audioSourceId = 0;
-	
-	std::ostringstream hashKey;
-	hashKey << type_table << ":" << rid;
-	std::cout << hashKey.str() << std::endl;
-	std::unordered_map<std::string,std::string> hashInfo = redis_conn->getHashAll(hashKey.str());
-	Json::Value payinfos(Json::arrayValue);
-	if(!hashInfo.empty()){
-		if(type == 0 && hashInfo.count("audiosourceid")>0){
-			audioSourceId = atol(hashInfo["audiosourceid"].c_str());
-		}
-		for(auto it=hashInfo.begin();it!=hashInfo.end();++it){
-			tempjson[it->first] = it->second;
-		}
-	}else{
-		//check in mysql
-		std::shared_ptr<mysqlconnector> sql_conn = mysql_pool->get_connection();
-		std::ostringstream s_sql;
-		s_sql << "select * from " << type_table << " where id=" << rid;
-		std::cout << s_sql.str() << std::endl;
-		std::string sql = s_sql.str();
-		int cnt = sql_conn->execute(sql);
-		std::cout << "count:" << cnt << std::endl;
-		if(cnt > 0){
-			mysqlresult *res = sql_conn->fetchall();
-			std::cout << "XXXXXX" << std::endl;
-			if(res != nullptr){
-				for(auto iter=res->m_rows.begin();iter!=res->m_rows.end();iter++){
-					std::cout << "XXXXXX" << std::endl;
-					std::unordered_map<std::string,std::string> hashData;
-					int id = (*iter)->get_value("id");
-					audioSourceId = (*iter)->get_value("audiosourceid");
-					std::cout <<(int)(*iter)->get_value("id") << std::endl;
-					if(server_config.count(type_table) == 0){
-						//error
-					}
-					std::unordered_map<std::string,std::string> table_config = server_config[type_table];
-					for(auto it=table_config.begin(); it!=table_config.end(); ++it){
-						//std::cout << it->second << "---" << it->first << std::endl;
-						std::string val = (*iter)->get_value(it->first);
-						tempjson[it->second.c_str()] = val;
-						hashData.emplace(it->second,val);
-					}
-					//set redis data
-					hashKey.str("");
-					hashKey << type_table << ":" << rid;
-					std::cout << hashKey.str() << std::endl;
-					if(!redis_conn->setHash(hashKey.str(), hashData)){
-						std::cout << "set hash failed : " << rid << std::endl;
-					}
-				}
-				res->free();
-			}else{
-				std::cout << "sql fetch res null" << std::endl;
-			}
-		}else{
-			//set redis null
-			hashKey.str("");
-			hashKey << type_table << ":" << rid;
-			std::cout << hashKey.str() << std::endl;
-			std::unordered_map<std::string,std::string> hashData;
-			hashData.emplace("id","0");
-			if(!redis_conn->setHash(hashKey.str(), hashData)){
-			}
-		}
-	}
+	LOG(INFO) << formatStr("add task action-%s success",task->action_id.c_str()) << std::endl;
 
-	if( type == 0 || type == 1){
-		//pay info
-		Json::Value payinfo;
-		hashKey.str("");
-		hashKey << type_table << ":Pay:" << rid;
-		std::cout << hashKey.str() << std::endl;
-		std::vector<std::string> payPolicy = redis_conn->getSet(hashKey.str());
-		if(!payPolicy.empty()){
-			for(auto itpolicy=payPolicy.begin();itpolicy!=payPolicy.end();++itpolicy){
-				if(*itpolicy == "none"){
-					continue;
-				}
-				hashKey.str("");
-				hashKey << type_table << ":" << *itpolicy << ":" << rid;
-				hashInfo = redis_conn->getHashAll(hashKey.str());
-				for(auto it=hashInfo.begin();it!=hashInfo.end();++it){
-					payinfo[it->first] = it->second;
-				}
-				payinfos.append(payinfo);
-			}
-		}else{
-			//check in mysql pay info
-			std::shared_ptr<mysqlconnector> sql_conn = mysql_pool->get_connection();
-			std::ostringstream s_sql;
-			s_sql << "select * from MusicPay where policy!=\"none\" and type=" << type << " and rid=" << rid;
-			std::cout << s_sql.str() << std::endl;
-			std::string sql = s_sql.str();
-			int cnt = sql_conn->execute(sql);
-			std::cout << "count:" << cnt << std::endl;
-			if(cnt > 0){
-				mysqlresult *res = sql_conn->fetchall();
-				if(res != nullptr){
-					for(auto iter=res->m_rows.begin();iter!=res->m_rows.end();iter++){
-						std::unordered_map<std::string,std::string> hashData;
-						int id = (*iter)->get_value("id");
-						std::cout <<(int)(*iter)->get_value("id") << std::endl;
-						std::string policy = (*iter)->get_value("policy");
-						if(server_config.count("Payinfo") == 0){
-							//error
-						}
-						std::unordered_map<std::string,std::string> table_config = server_config["Payinfo"];
-						for(auto it=table_config.begin(); it!=table_config.end(); ++it){
-							//std::cout << it->second << "---" << it->first << std::endl;
-							std::string val = (*iter)->get_value(it->first);
-							payinfo[it->second.c_str()] = val;
-							hashData.emplace(it->second,val);
-						}
-						//set redis data
-						hashKey.str("");
-						hashKey << type_table << ":" << policy << ":" << rid;
-						std::cout << hashKey.str() << std::endl;
-						if(!redis_conn->setHash(hashKey.str(), hashData)){
-						}
-						//set redis
-						hashKey.str("");
-						hashKey << type_table << ":Pay:" << rid;
-						std::cout << hashKey.str() << std::endl;
-						if(!redis_conn->setAdd(hashKey.str(), policy)){
-						}
-						if(!redis_conn->setDel(hashKey.str(), "none")){
-						}
-						payinfos.append(payinfo);
-					}
-					res->free();
-				}else{
-					std::cout << "sql fetch res null" << std::endl;
-				}
-			}else{
-				//set redis null
-				hashKey.str("");
-				hashKey << type_table << ":Pay:" << rid;
-				std::cout << hashKey.str() << std::endl;
-				if(!redis_conn->setAdd(hashKey.str(), "none")){
-				}
-			}
-		}
-	}
-	//audio info
-	Json::Value audioinfos(Json::arrayValue);
-	if(type == 0){
-		//audio info
-		Json::Value audioinfo;
-		hashKey.str("");
-		hashKey << type_table << ":Audio:" << rid;
-		std::cout << hashKey.str() << std::endl;
-		std::vector<std::string> audio_list = redis_conn->getSet(hashKey.str());
-		if(!audio_list.empty()){
-			for(auto itAudio=audio_list.begin();itAudio!=audio_list.end();++itAudio){
-				hashKey.str("");
-				hashKey << "Audio:" << *itAudio;
-				hashInfo = redis_conn->getHashAll(hashKey.str());
-				for(auto it=hashInfo.begin();it!=hashInfo.end();++it){
-					audioinfo[it->first] = it->second;
-				}
-				audioinfos.append(audioinfo);
-			}
-		}else{
-			if(audioSourceId > 0){
-				//check in mysql audio info
-				std::shared_ptr<mysqlconnector> sql_conn = mysql_pool->get_connection();
-				std::ostringstream s_sql;
-				s_sql << "select * from AudioProduct where audiosourceid=" << audioSourceId;
-				std::cout << s_sql.str() << std::endl;
-				std::string sql = s_sql.str();
-				int cnt = sql_conn->execute(sql);
-				std::cout << "count:" << cnt << std::endl;
-				if(cnt > 0){
-					mysqlresult *res = sql_conn->fetchall();
-					if(res != nullptr){
-						for(auto iter=res->m_rows.begin();iter!=res->m_rows.end();iter++){
-							std::unordered_map<std::string,std::string> hashData;
-							std::string audioProductId = (*iter)->get_value("id");
-							std::cout <<(int)(*iter)->get_value("id") << std::endl;
-							if(server_config.count("Audioinfo") == 0){
-								//error
-							}
-							std::unordered_map<std::string,std::string> table_config = server_config["Audioinfo"];
-							for(auto it=table_config.begin(); it!=table_config.end(); ++it){
-								//std::cout << it->second << "---" << it->first << std::endl;
-								std::string val = (*iter)->get_value(it->first);
-								audioinfo[it->second.c_str()] = val;
-								hashData.emplace(it->second,val);
-							}
-							//set redis data
-							hashKey.str("");
-							hashKey << "Audio:" << audioProductId;
-							std::cout << hashKey.str() << std::endl;
-							if(!redis_conn->setHash(hashKey.str(), hashData)){
-							}
-							//set redis
-							hashKey.str("");
-							hashKey << type_table << ":Audio:" << rid;
-							std::cout << hashKey.str() << std::endl;
-							if(!redis_conn->setAdd(hashKey.str(), audioProductId)){
-							}
-							audioinfos.append(audioinfo);
-						}
-						res->free();
-					}else{
-						std::cout << "sql fetch res null" << std::endl;
-					}
-				}
-			}
-		}
-	}
-	tempjson["payinfo"] = payinfos;
-	tempjson["audioinfo"] = audioinfos;
-	data[type_table] = tempjson;
-	result["status"] = "success";
-	result["msg"] = "OK";
-	result["data"] = data;
 	std::string return_str = writer.write(result);
 	int ret = evbuffer_add_printf(retbuff, return_str.c_str());
 	if(ret == -1){
@@ -831,5 +535,6 @@ void httpServer::getinfo_process(struct evhttp_request *request){
 }
 
 void httpServer::event_timeout(int fd, short events, void *args){
+	LOG(INFO) << "timeout 10s" << std::endl;
 }
 

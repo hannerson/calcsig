@@ -2,7 +2,7 @@
 # 20190113
 ##########
 
-exclude_dirs=include bin jsoncpp glog test src
+exclude_dirs=include bin jsoncpp glog test src hiredis-vip-bypass
 dirs := $(shell find . -maxdepth 1 -type d)
 dirs := $(basename $(patsubst ./%,%,$(dirs)))
 dirs := $(filter-out $(exclude_dirs),$(dirs))

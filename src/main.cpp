@@ -1,6 +1,6 @@
 #include "server.h"
 #include "utils/config.h"
-#include <glog/logging.h>
+#include "glog/logging.h"
 
 
 int main(int argc, char **argv){
@@ -9,8 +9,10 @@ int main(int argc, char **argv){
 		std::cout << "usage: " << std::string(argv[0]) << " " << "configfile" << std::endl;
 		return -1;
 	}
+	FLAGS_logbufsecs = 0;
+	FLAGS_log_prefix = true;
 	google::InitGoogleLogging("http_server");
-	google::SetLogDestination(google::INFO, "/home/dmsMusic/http_server");
+	google::SetLogDestination(google::INFO, "http_server");
 	google::FlushLogFiles(google::INFO);
 	class configParser* configptr = new configParser(std::string (argv[1]));
 	if(configptr->loadConfig() == -1){

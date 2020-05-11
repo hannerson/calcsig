@@ -1,13 +1,14 @@
 ###########
 ###20190113
 ###########
+include ../common.mk
 
-CXX=/usr/local/gcc-4.8/bin/g++
-CXXFLAGS=-g -Wall -c -std=c++11
+CXX=g++
+CXXFLAGS=-g -Wall -c
 LDFLAGS=-L/usr/local/lib -L/usr/lib64/mysql/ -L/usr/local/lib64/
-LIBS=-lpthread -lglog -lcrypto -levent -ljsoncpp -lglog -lmysqlclient
-INCLUDES=-I/usr/include/mysql/ -I/usr/local/include -I../ -I../hiredis-vip-master
-STATICS=/usr/local/lib64/libjsoncpp.a ../hiredis-vip-master/libhiredis_vip.a
+LIBS=-lpthread -lcrypto
+INCLUDES=-I/usr/include/mysql/ -I/usr/local/include -I../json/include
+STATICS=../jsoncpp/lib/libjsoncpp.a ../glog/lib/libglog.a
 
 srcs:=$(wildcard *.cpp *.hpp)
 objs:=$(patsubst %.cpp,%.o,$(patsubst %.hpp,%.o,$(srcs)))
